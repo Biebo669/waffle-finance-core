@@ -182,6 +182,29 @@ pnpm test
 # RUN_DEVNET_E2E is not set → devnet tests are skipped automatically
 ```
 
+### Preflight report (fail fast on missing prerequisites)
+
+When `RUN_DEVNET_E2E="true"` is set, the `devnet preflight` case runs before
+any provider connection is opened:
+
+- Flag absent → all devnet suites stay skipped, preflight passes silently.
+- Flag present but a chain's required variables are missing → the run fails
+  fast naming the missing **variable names** (e.g. `EVM Sepolia:
+  DEVNET_EVM_PRIVATE_KEY`) and the safe network identifier. Secret values,
+  RPC tokens, and private keys are never printed.
+
+Exact required variables per chain:
+
+| Chain | Required variables |
+|-------|--------------------|
+| EVM Sepolia | `DEVNET_EVM_PRIVATE_KEY` |
+| Stellar testnet | `DEVNET_STELLAR_SECRET_KEY` |
+| Solana devnet | `DEVNET_SOLANA_SECRET_KEY`, `DEVNET_SOLANA_PROGRAM_ID` |
+
+Optional overrides (`DEVNET_*_RPC_URL`, `DEVNET_*_CONTRACT_ADDRESS` /
+`DEVNET_*_CONTRACT_ID`, amounts, beneficiary, token) fall back to the
+defaults in the tables above.
+
 ### Run a specific test file
 
 ```powershell
