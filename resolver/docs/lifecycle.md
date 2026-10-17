@@ -423,3 +423,49 @@ process.on('SIGTERM', async () => {
 - [Resolver README](../README.md)
 - [Health Checks](./health-checks.md)
 - [Supervisor](./supervisor.md)
+
+## Restart and Recovery Behavior
+
+The supervisor (`src/supervisor.ts`) restarts listeners on recoverable errors
+with exponential backoff and exits when recovery is no longer possible.
+Defaults (constructor options, also hardwired in `src/commands/run.ts`):
+
+- `maxRestarts = 5`
+- `restartDelayMs = 5_000`
+- `maxRestartDelayMs = 60_000`
+- Backoff: `delay = min(restartDelayMs * 2^(restartCount - 1), maxRestartDelayMs)`
+- A `FatalError` never retries — the supervisor transitions to `failed` immediately.
+- When `restartCount > maxRestarts`, the supervisor transitions to `failed`
+  and throws `Supervisor: max restarts exceeded`, which makes the process exit
+  non-zero (`run.ts`). `failed` and `stopped` are terminal: a new process
+  instance is required. `stop()` is idempotent and cancels a pending
+  restart-delay sleep so shutdown is not delayed.
+
+Lifecycle metrics for alerting (`src/metrics.ts`):
+
+- `resolver_lifecycle_state{state}` — gauge, exactly one state is `1`.
+- `resolver_lifecycle_transitions_total{from,to}` — counter.
+- `resolver_lifecycle_duration_seconds{state}` — histogram.
+
+Health signals (`src/health.ts`, `GET /health`, `GET /readyz`, `GET /healthz`;
+ports `RESOLVER_HEALTH_PORT` default `3003`, `RESOLVER_METRICS_PORT` default
+`3002`):
+
+- `/health` returns `503` when the lifecycle state is `failed`; `readyz`
+  returns `503` when the state is `stopping`, `stopped`, or `failed`, or when
+  any dependency check fails.
+
+### Recovery table
+
+| Case | Lifecycle state | Health signal | Operator action |
+|------|----------------|---------------|-----------------|
+| Transient listener failure (recoverable error, restarts remaining) | `restarting` (returns to `running`) | `/health` `200` (`healthy`/`degraded`), `restarts` incremented | No action. Automatic retry with backoff; monitor `resolver_lifecycle_transitions_total` and restart count. |
+| Exhausted retries or fatal error | `failed` (terminal) | `/health` `503`, `/readyz` `503` | Manual restart required: fix the underlying cause (see logs for `max restarts exceeded` or `fatal listener error`), then start a new process instance. |
+| Gracefully paused | `paused` (via `pausing`) | `/health` reflects paused lifecycle state | No restart needed. Resume via the configured resume path, or `stop()` then start a new instance if shutdown is intended. |
+| Cleanly stopped | `stopped` (terminal) | `/readyz` `503` | No recovery needed if shutdown was intentional. Otherwise start a new process instance. |
+
+Related configuration: restart limits are code defaults (`SupervisorOptions`
+`maxRestarts` / `restartDelayMs` / `maxRestartDelayMs`); health/metrics ports
+via `RESOLVER_HEALTH_PORT` / `RESOLVER_METRICS_PORT`; polling and chain
+settings via the standard resolver config (`NETWORK_MODE`, RPC URLs, keys,
+`pollIntervalMs`, see `packages/config`).
