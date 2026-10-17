@@ -289,6 +289,42 @@ export class Supervisor {
       };
     });
   }
+
+  /**
+   * Stop every listener, attempting all cleanups even when one throws.
+   *
+   * Each listener's stop() is awaited in order; failures are logged and
+   * collected. When a lifecycle manager is present it transitions to
+   * `failed` on any cleanup error, otherwise to `stopped`. The first
+   * error is rethrown (awaited by the caller, so no unhandled rejection)
+   * after all listeners have been given a chance to stop.
+   */
+  async stopAll(listeners: ListenerSet[]): Promise<void> {
+    const errors: unknown[] = [];
+    for (const listener of listeners) {
+      try {
+        await listener.stop();
+      } catch (err) {
+        errors.push(err);
+        this.log.error({ err }, "listener stop failed — continuing cleanup");
+      }
+    }
+    if (errors.length > 0) {
+      try {
+        this.lifecycle?.transition("failed");
+      } catch {
+        // Lifecycle may already be terminal; state is still reported via error.
+      }
+      this._state = "failed";
+      throw errors[0];
+    }
+    this._state = "stopped";
+    try {
+      this.lifecycle?.transition("stopped");
+    } catch {
+      // Already stopped — safe to ignore.
+    }
+  }
 }
 
 // ── FatalError ────────────────────────────────────────────────────────────────
