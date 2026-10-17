@@ -11,6 +11,7 @@ import { mainnet, sepolia } from 'wagmi/chains';
 import { classifyRpcError } from '@wafflefinance/sdk';
 import { isTestnet, getCurrentNetwork } from '../../config/networks';
 import { selectApiBaseUrl, selectIsMockDataEnabled, selectSolanaRoutesEnabled } from '../../config/selectors';
+import { resolveProcessingFailureOutcome } from './processingFallback';
 import { parseHtlcReceipt } from '../../lib/parseHtlcReceipt';
 import { sanitizeAmountInput } from '../../lib/sanitizeAmountInput';
 import { useBridgeOrchestration } from '../../hooks/useBridgeOrchestration';
@@ -1046,7 +1047,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
             } else {
               console.error('❌ Processing request failed:', processResponse.status);
 
-              if (ENABLE_MOCK_DATA) {
+              if (resolveProcessingFailureOutcome({ enableMockData: ENABLE_MOCK_DATA, isProductionBuild: import.meta.env.PROD }) === 'mock-success') {
                 console.log('🧪 Mock data enabled: showing success despite processing failure');
                 updateTransactionStatus(result.orderId, 'completed');
                 setStatusMessage('Completed ✅');
@@ -1062,7 +1063,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           } catch (processError) {
             console.error('❌ Processing request error:', processError);
 
-            if (ENABLE_MOCK_DATA) {
+            if (resolveProcessingFailureOutcome({ enableMockData: ENABLE_MOCK_DATA, isProductionBuild: import.meta.env.PROD }) === 'mock-success') {
               console.log('🧪 Mock data enabled: showing success despite processing error');
               updateTransactionStatus(result.orderId, 'completed');
               setStatusMessage('Completed ✅');
