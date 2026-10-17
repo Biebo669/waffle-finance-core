@@ -10,6 +10,12 @@ export interface RetryOptions {
    * than retrying.  Useful for write-path callers that must not double-submit.
    */
   noRetry?: boolean;
+  /**
+   * Optional abort signal. When aborted, the retry loop stops promptly:
+   * no further attempts are scheduled and the caller receives a
+   * `RetryCancelledError` (distinguishable from retryable RPC failures).
+   */
+  signal?: AbortSignal;
 }
 
 // ── RPC error classification ──────────────────────────────────────────────────
@@ -142,7 +148,7 @@ export function effectiveBaseDelay(
   return Math.min(maxDelayMs, Math.max(0, baseDelayMs * multiplier));
 }
 
-const DEFAULTS: Required<Omit<RetryOptions, 'logger'>> & { onRetry: NonNullable<RetryOptions['onRetry']> } = {
+const DEFAULTS: Required<Omit<RetryOptions, 'logger' | 'signal'>> & { onRetry: NonNullable<RetryOptions['onRetry']> } = {
   maxAttempts: 5,
   baseDelayMs: 1000,
   maxDelayMs: 30000,
@@ -169,7 +175,7 @@ const DEFAULTS: Required<Omit<RetryOptions, 'logger'>> & { onRetry: NonNullable<
  */
 export function normalizeRetryOptions(
   opts: RetryOptions
-): Required<Omit<RetryOptions, 'logger'>> & { onRetry: NonNullable<RetryOptions['onRetry']> } {
+): Required<Omit<RetryOptions, 'logger' | 'signal'>> & { onRetry: NonNullable<RetryOptions['onRetry']> } {
   const merged = { ...DEFAULTS, ...opts };
 
   if (merged.maxAttempts < 1) {
@@ -198,6 +204,13 @@ export class TransientError extends Error {
   }
 }
 
+export class RetryCancelledError extends Error {
+  constructor(message = "Retry cancelled") {
+    super(message);
+    this.name = "RetryCancelledError";
+  }
+}
+
 export function calculateBackoff(
   attempt: number,
   baseDelayMs: number,
@@ -209,18 +222,48 @@ export function calculateBackoff(
   return Math.max(0, Math.round(exponential + jitter));
 }
 
+/**
+ * Sleep that rejects promptly when `signal` aborts, clearing the timer
+ * so no late attempt is scheduled after shutdown.
+ */
+function sleepCancellable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  if (signal.aborted) {
+    return Promise.reject(new RetryCancelledError());
+  }
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(new RetryCancelledError());
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   opts: RetryOptions = {}
 ): Promise<T> {
   const { maxAttempts, baseDelayMs, maxDelayMs, jitterFactor, onRetry, noRetry } =
     normalizeRetryOptions(opts);
+  const signal = opts.signal;
 
   let lastError: Error | undefined;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (signal?.aborted) throw new RetryCancelledError();
     try {
       return await fn();
     } catch (err: unknown) {
+      if (err instanceof RetryCancelledError) throw err;
+      if (signal?.aborted) throw new RetryCancelledError();
       lastError = err instanceof Error ? err : new Error(String(err));
 
       // noRetry: give up after the first failure (write-path safety).
@@ -234,9 +277,10 @@ export async function withRetry<T>(
       const delay = calculateBackoff(attempt, adjustedBase, maxDelayMs, jitterFactor);
 
       onRetry(attempt + 1, delay, lastError);
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      await sleepCancellable(delay, signal);
     }
   }
+  if (signal?.aborted) throw new RetryCancelledError();
   throw lastError!;
 }
 
