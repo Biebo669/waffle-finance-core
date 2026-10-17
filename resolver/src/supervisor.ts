@@ -185,12 +185,26 @@ export class Supervisor {
       throw err;
     }
 
+    // Shutdown may have been requested while startup was still in flight.
+    // Never mark the service running after shutdown began — tear down the
+    // late listener instead so no subscription leaks.
+    if (this._stopped) {
+      await this.absorbLateStartup(listeners);
+      return;
+    }
+
     this._state = "running";
     this.lifecycle?.transition('running');
 
     while (!this._stopped) {
       try {
         await listeners.start();
+        // Shutdown may also have arrived during this (re)start. Tear down
+        // the late listener rather than leaking it on the clean-exit path.
+        if (this._stopped) {
+          await this.absorbLateStartup(listeners);
+          return;
+        }
         // Clean exit — listeners finished without error.
         this._state = "stopped";
         this.lifecycle?.transition('stopped');
@@ -272,6 +286,24 @@ export class Supervisor {
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
+
+  /**
+   * Tear down a listener whose `start()` resolved after `stop()` was called.
+   * The late subscription is stopped (best-effort) and the supervisor parks
+   * in the terminal `stopped` state — it is never marked `running` once
+   * shutdown has begun.
+   */
+  private async absorbLateStartup(listeners: ListenerSet): Promise<void> {
+    this._state = "stopping";
+    this.lifecycle?.transition('stopping');
+    try {
+      await listeners.stop();
+    } catch (err) {
+      this.log.warn({ err }, "error stopping late listener after shutdown — ignoring");
+    }
+    this._state = "stopped";
+    this.lifecycle?.transition('stopped');
+  }
 
   /**
    * Sleep for `ms` milliseconds.  The sleep is interruptible: calling
