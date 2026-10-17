@@ -144,6 +144,7 @@ export default function NetworkMismatchBanner({ networkState }: Props) {
         <button
           onClick={onSwitchWalletToApp}
           disabled={busy}
+          aria-label={`Switch wallet to ${expectedLabel}`}
           className="px-3 py-1.5 rounded-md bg-amber-400/20 hover:bg-amber-400/30 text-amber-50 text-xs font-semibold border border-amber-300/30 transition-colors disabled:opacity-50"
         >
           Switch wallet to {expectedLabel}
@@ -152,6 +153,7 @@ export default function NetworkMismatchBanner({ networkState }: Props) {
           <button
             onClick={onSwitchAppToWallet}
             disabled={busy}
+            aria-label="Switch app to wallet network"
             className="px-3 py-1.5 rounded-md bg-white/5 hover:bg-white/10 text-amber-50 text-xs font-medium border border-white/10 transition-colors disabled:opacity-50"
           >
             Switch app to wallet
