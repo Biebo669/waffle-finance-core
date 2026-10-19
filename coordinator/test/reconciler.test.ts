@@ -1190,3 +1190,60 @@ describe("Reconciler — #576: unsafe integer guard", () => {
     expect(reconciler.getStatus().eventsReplayed).toBe(0);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. Chain / coordinator terminal-state agreement
+// ─────────────────────────────────────────────────────────────────────────────
+// A chain transaction can succeed while the coordinator stays stale until
+// event processing catches up. These assertions verify that the harness
+// eventually reconciles the public order state with the chain outcome for
+// one successful claim and one refund scenario. Each test runs the existing
+// reconciliation path once and requires at least one replayed event, so a
+// missing event fails fast instead of timing out indefinitely. No live
+// network is required (all chain reads are mocked).
+
+describe("Reconciler — chain/coordinator terminal-state agreement", () => {
+  it("claim: chain OrderClaimed and coordinator agree on the terminal outcome", async () => {
+    const orders = await freshOrders();
+    const order = await seedOrder(orders, VALID_HASHLOCK);
+    await orders.recordSrcLock({ publicId: order.publicId, orderId: "77", txHash: "0xabc", blockNumber: 100, timelock: 9_999 });
+
+    const r = new Reconciler(BASE_CFG, orders, log);
+    const mock = ethMock();
+    const chainTerminalEvents = [ethClaimedLog(77n, VALID_PREIMAGE)];
+    mock.getLogs.mockImplementation(async ({ event }: any) =>
+      event?.name === "OrderClaimed" ? chainTerminalEvents : []
+    );
+
+    await r.run();
+
+    // Fails if no chain event was processed (no silent pass on stale state).
+    expect(r.getStatus().eventsReplayed).toBeGreaterThan(0);
+    // Chain side reached its terminal event; coordinator must match it.
+    expect(chainTerminalEvents).toHaveLength(1);
+    const updated = await orders.get(order.publicId);
+    expect(updated?.status).toBe("secret_revealed");
+    expect(updated?.preimage).toBe(VALID_PREIMAGE);
+  });
+
+  it("refund: chain OrderRefunded and coordinator agree on the terminal outcome", async () => {
+    const orders = await freshOrders();
+    const order = await seedOrder(orders);
+    await orders.recordSrcLock({ publicId: order.publicId, orderId: "55", txHash: "0xabc", blockNumber: 100, timelock: 9_999 });
+
+    const r = new Reconciler(BASE_CFG, orders, log);
+    const mock = ethMock();
+    const chainTerminalEvents = [ethRefundedLog(55n)];
+    mock.getLogs.mockImplementation(async ({ event }: any) =>
+      event?.name === "OrderRefunded" ? chainTerminalEvents : []
+    );
+
+    await r.run();
+
+    // Fails if no chain event was processed (no silent pass on stale state).
+    expect(r.getStatus().eventsReplayed).toBeGreaterThan(0);
+    // Chain side reached its terminal event; coordinator must match it.
+    expect(chainTerminalEvents).toHaveLength(1);
+    expect((await orders.get(order.publicId))?.status).toBe("refunded");
+  });
+});
