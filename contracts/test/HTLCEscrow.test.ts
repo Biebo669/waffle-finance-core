@@ -1602,4 +1602,173 @@ describe("HTLCEscrow v2", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Issue #870 — ERC20 transfer return variant regression cases
+  // ---------------------------------------------------------------------------
+  describe("ERC20 transfer return variants (#870)", () => {
+    // SafeERC20 handles three ERC20 return patterns:
+    //   - Returns true   → accepted (standard ERC20)
+    //   - Returns nothing → accepted (USDT-style void transfer)
+    //   - Returns false  → rejected (SafeERC20 treats false as revert)
+    //
+    // These tests verify that the escrow's safeTransferFrom / safeTransfer
+    // path behaves correctly for each variant.
+
+    const TOKEN_SUPPLY = ethers.parseEther("1000000");
+
+    async function deployReturnsTrueToken() {
+      const F = await ethers.getContractFactory("ReturnsTrueERC20");
+      return F.deploy(TOKEN_SUPPLY) as Promise<ReturnsTrueERC20>;
+    }
+
+    async function deployNoReturnToken() {
+      const F = await ethers.getContractFactory("NoReturnERC20");
+      return F.deploy(TOKEN_SUPPLY) as Promise<NoReturnERC20>;
+    }
+
+    async function deployReturnsFalseToken() {
+      const F = await ethers.getContractFactory("ReturnsFalseERC20");
+      return F.deploy(TOKEN_SUPPLY) as Promise<ReturnsFalseERC20>;
+    }
+
+    // ── createOrder (safeTransferFrom) ───────────────────────────────────────
+
+    it("standard (returns true): createOrder locks tokens successfully", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployReturnsTrueToken();
+      const escrowAddr = await escrow.getAddress();
+
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          await token.getAddress(),
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          hashlock,
+          TIMELOCK,
+          { value: SAFETY_DEPOSIT }
+        )
+      ).to.not.be.reverted;
+
+      expect(await token.balanceOf(escrowAddr)).to.equal(AMOUNT);
+    });
+
+    it("no-return (void transfer): createOrder locks tokens successfully", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployNoReturnToken();
+      const escrowAddr = await escrow.getAddress();
+
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          await token.getAddress(),
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          hashlock,
+          TIMELOCK,
+          { value: SAFETY_DEPOSIT }
+        )
+      ).to.not.be.reverted;
+
+      expect(await token.balanceOf(escrowAddr)).to.equal(AMOUNT);
+    });
+
+    it("false-return: createOrder reverts — SafeERC20 rejects a false transferFrom", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployReturnsFalseToken();
+      const escrowAddr = await escrow.getAddress();
+
+      // Even with a generous approval, ReturnsFalseERC20.transferFrom always
+      // returns false; SafeERC20 must surface this as a revert so the order
+      // is never created.
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          await token.getAddress(),
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          hashlock,
+          TIMELOCK,
+          { value: SAFETY_DEPOSIT }
+        )
+      ).to.be.reverted; // SafeERC20 reverts on false return
+
+      // No order was stored.
+      expect(await escrow.nextOrderId()).to.equal(1n);
+    });
+
+    // ── claimOrder (safeTransfer) ────────────────────────────────────────────
+
+    it("standard (returns true): claimOrder transfers tokens to beneficiary", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployReturnsTrueToken();
+      const escrowAddr = await escrow.getAddress();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        await token.getAddress(),
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: SAFETY_DEPOSIT }
+      );
+
+      const beneficiaryBefore = await token.balanceOf(beneficiary.address);
+      await escrow.connect(beneficiary).claimOrder(1, preimage);
+
+      expect(await token.balanceOf(beneficiary.address)).to.equal(
+        beneficiaryBefore + AMOUNT
+      );
+      expect(await token.balanceOf(escrowAddr)).to.equal(0n);
+    });
+
+    it("no-return (void transfer): claimOrder transfers tokens to beneficiary", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployNoReturnToken();
+      const escrowAddr = await escrow.getAddress();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        await token.getAddress(),
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: SAFETY_DEPOSIT }
+      );
+
+      const beneficiaryBefore = await token.balanceOf(beneficiary.address);
+      await escrow.connect(beneficiary).claimOrder(1, preimage);
+
+      expect(await token.balanceOf(beneficiary.address)).to.equal(
+        beneficiaryBefore + AMOUNT
+      );
+      expect(await token.balanceOf(escrowAddr)).to.equal(0n);
+    });
+  });
 });
