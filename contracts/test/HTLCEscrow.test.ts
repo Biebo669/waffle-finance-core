@@ -2,6 +2,11 @@ import { expect } from "chai";
 import { ethers } from "hardhat";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
 import type { HTLCEscrow, TestERC20 } from "../typechain-types";
+import type {
+  ReturnsTrueERC20,
+  NoReturnERC20,
+  ReturnsFalseERC20,
+} from "../typechain-types";
 
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
 const TIMELOCK = 600; // 10 minutes
@@ -1328,4 +1333,130 @@ describe("HTLCEscrow v2", () => {
       expect(order.finalisedAt).to.be.greaterThan(0);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Issue #867 — zero-address constructor tests for escrow dependencies
+  // ---------------------------------------------------------------------------
+  describe("constructor — zero-address dependency guards (#867)", () => {
+    // HTLCEscrow constructor:
+    //   constructor(IResolverRegistry _resolverRegistry, uint256 _minSafetyDeposit)
+    //
+    // _resolverRegistry is intentionally optional (address(0) disables the sybil
+    // gate and makes createOrder permissionless), so passing zero is accepted.
+    // _minSafetyDeposit = 0 is also accepted (advisory only).
+    //
+    // ResolverRegistry constructor:
+    //   constructor(IERC20 _stakeAsset, uint256 _minStake, address _slashBeneficiary, address _owner)
+    //
+    // All three address parameters are required to be non-zero; minStake must be > 0.
+
+    it("HTLCEscrow: accepts address(0) as resolverRegistry — permissionless mode is intentional", async () => {
+      const HTLCEscrowFactory = await ethers.getContractFactory("HTLCEscrow");
+      // Should deploy without reverting; zero registry is the documented way to
+      // make createOrder permissionless.
+      const escrow = await HTLCEscrowFactory.deploy(ZERO_ADDR, 0);
+      expect(await escrow.resolverRegistry()).to.equal(ZERO_ADDR);
+    });
+
+    it("ResolverRegistry: reverts with InvalidAddress when stakeAsset is zero", async () => {
+      const [owner] = await ethers.getSigners();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      await expect(
+        RegistryFactory.deploy(
+          ZERO_ADDR,           // _stakeAsset — required non-zero
+          ethers.parseEther("1"),
+          owner.address,
+          owner.address
+        )
+      ).to.be.revertedWithCustomError(
+        await RegistryFactory.deploy(
+          await deployToken().then((t) => t.getAddress()),
+          ethers.parseEther("1"),
+          owner.address,
+          owner.address
+        ),
+        "InvalidAddress"
+      );
+    });
+
+    it("ResolverRegistry: reverts with InvalidAddress when slashBeneficiary is zero", async () => {
+      const [owner] = await ethers.getSigners();
+      const token = await deployToken();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      const stub = await RegistryFactory.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      await expect(
+        RegistryFactory.deploy(
+          await token.getAddress(),
+          ethers.parseEther("1"),
+          ZERO_ADDR,           // _slashBeneficiary — required non-zero
+          owner.address
+        )
+      ).to.be.revertedWithCustomError(stub, "InvalidAddress");
+    });
+
+    it("ResolverRegistry: reverts when owner is zero — OpenZeppelin Ownable guard fires first", async () => {
+      // OpenZeppelin's Ownable constructor checks for address(0) before
+      // our InvalidAddress guard, so the revert reason is OwnableInvalidOwner.
+      // Both guards protect against the same misconfiguration; the OZ check
+      // simply fires first in the constructor execution order.
+      const [owner] = await ethers.getSigners();
+      const token = await deployToken();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      const stub = await RegistryFactory.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      await expect(
+        RegistryFactory.deploy(
+          await token.getAddress(),
+          ethers.parseEther("1"),
+          owner.address,
+          ZERO_ADDR            // _owner — protected by OZ Ownable before InvalidAddress
+        )
+      ).to.be.revertedWithCustomError(stub, "OwnableInvalidOwner");
+    });
+
+    it("ResolverRegistry: reverts with InvalidAmount when minStake is zero", async () => {
+      const [owner] = await ethers.getSigners();
+      const token = await deployToken();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      const stub = await RegistryFactory.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      await expect(
+        RegistryFactory.deploy(
+          await token.getAddress(),
+          0,                   // _minStake — must be > 0
+          owner.address,
+          owner.address
+        )
+      ).to.be.revertedWithCustomError(stub, "InvalidAmount");
+    });
+
+    it("ResolverRegistry: deploys successfully when all required addresses are valid and minStake > 0", async () => {
+      const [owner] = await ethers.getSigners();
+      const token = await deployToken();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      const registry = await RegistryFactory.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      expect(await registry.stakeAsset()).to.equal(await token.getAddress());
+      expect(await registry.slashBeneficiary()).to.equal(owner.address);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
 });
