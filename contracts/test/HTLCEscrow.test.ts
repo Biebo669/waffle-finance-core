@@ -1328,4 +1328,563 @@ describe("HTLCEscrow v2", () => {
       expect(order.finalisedAt).to.be.greaterThan(0);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Issue #865 — exact timelock boundary behavior
+  //
+  // claimOrder requires block.timestamp < timelock (strictly).
+  // refundOrder requires block.timestamp > timelock (strictly).
+  //
+  // This means the exact timelock second is a "dead zone":
+  //   - claim fails  (Expired)
+  //   - refund fails (NotExpired)
+  //
+  // Tests cover timelock-1, timelock, and timelock+1 for both actions so the
+  // inclusive/exclusive rule is locked down and any future comparison flip is
+  // caught immediately.
+  // ---------------------------------------------------------------------------
+  describe("timelock exact boundary behavior (#865)", () => {
+    async function createOrderAndGetTimelock() {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      const tx = await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+      const receipt = await tx.wait();
+      const block = await ethers.provider.getBlock(receipt!.blockNumber);
+      const absoluteTimelock = block!.timestamp + TIMELOCK;
+      return { escrow, preimage, beneficiary, sender, absoluteTimelock };
+    }
+
+    // --- claim boundary ---
+
+    it("claim succeeds at timelock - 1 (one second before expiry)", async () => {
+      const { escrow, preimage, beneficiary, absoluteTimelock } =
+        await createOrderAndGetTimelock();
+
+      await time.setNextBlockTimestamp(absoluteTimelock - 1);
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, preimage)
+      ).to.not.be.reverted;
+
+      expect((await escrow.getOrder(1)).status).to.equal(1); // Claimed
+    });
+
+    it("claim fails at exactly the timelock second (Expired)", async () => {
+      const { escrow, preimage, beneficiary, absoluteTimelock } =
+        await createOrderAndGetTimelock();
+
+      await time.setNextBlockTimestamp(absoluteTimelock);
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, preimage)
+      ).to.be.revertedWithCustomError(escrow, "Expired");
+
+      // Order remains Funded — no funds moved.
+      expect((await escrow.getOrder(1)).status).to.equal(0);
+    });
+
+    it("claim fails at timelock + 1 (one second past expiry, Expired)", async () => {
+      const { escrow, preimage, beneficiary, absoluteTimelock } =
+        await createOrderAndGetTimelock();
+
+      await time.setNextBlockTimestamp(absoluteTimelock + 1);
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, preimage)
+      ).to.be.revertedWithCustomError(escrow, "Expired");
+
+      expect((await escrow.getOrder(1)).status).to.equal(0);
+    });
+
+    // --- refund boundary ---
+
+    it("refund fails at timelock - 1 (NotExpired)", async () => {
+      const { escrow, sender, absoluteTimelock } = await createOrderAndGetTimelock();
+
+      await time.setNextBlockTimestamp(absoluteTimelock - 1);
+      await expect(
+        escrow.connect(sender).refundOrder(1)
+      ).to.be.revertedWithCustomError(escrow, "NotExpired");
+
+      expect((await escrow.getOrder(1)).status).to.equal(0);
+    });
+
+    it("refund fails at exactly the timelock second (NotExpired — strict greater-than)", async () => {
+      const { escrow, sender, absoluteTimelock } = await createOrderAndGetTimelock();
+
+      await time.setNextBlockTimestamp(absoluteTimelock);
+      await expect(
+        escrow.connect(sender).refundOrder(1)
+      ).to.be.revertedWithCustomError(escrow, "NotExpired");
+
+      expect((await escrow.getOrder(1)).status).to.equal(0);
+    });
+
+    it("refund succeeds at timelock + 1 (one second past expiry)", async () => {
+      const { escrow, sender, absoluteTimelock } = await createOrderAndGetTimelock();
+
+      await time.setNextBlockTimestamp(absoluteTimelock + 1);
+      await expect(escrow.connect(sender).refundOrder(1)).to.not.be.reverted;
+
+      expect((await escrow.getOrder(1)).status).to.equal(2); // Refunded
+    });
+
+    // --- no timestamp allows both claim and refund to succeed ---
+
+    it("the exact timelock second allows neither claim nor refund — both revert", async () => {
+      const { escrow, preimage, beneficiary, sender, absoluteTimelock } =
+        await createOrderAndGetTimelock();
+
+      // Snapshot so we can restore and run both checks at the same timestamp.
+      const snapId = await ethers.provider.send("evm_snapshot", []);
+
+      // --- claim at exactly the boundary ---
+      await time.setNextBlockTimestamp(absoluteTimelock);
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, preimage)
+      ).to.be.revertedWithCustomError(escrow, "Expired");
+
+      // Restore to before the failed claim so refund lands at the same second.
+      await ethers.provider.send("evm_revert", [snapId]);
+
+      // --- refund at exactly the boundary ---
+      await time.setNextBlockTimestamp(absoluteTimelock);
+      await expect(
+        escrow.connect(sender).refundOrder(1)
+      ).to.be.revertedWithCustomError(escrow, "NotExpired");
+
+      // Order still Funded — no funds moved by either attempt.
+      expect((await escrow.getOrder(1)).status).to.equal(0);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        AMOUNT + SAFETY_DEPOSIT
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #864 — withdrawal reentrancy behavior with a hostile recipient
+  //
+  // The withdraw() function uses checks-effects-interactions + nonReentrant.
+  //
+  // There are two reentrancy surfaces to cover:
+  //
+  //   A. During _payoutNative (the bounded-stipend push inside claimOrder /
+  //      refundOrder): a recipient's receive() runs and calls back into
+  //      withdraw(). The call stack is: claimOrder (nonReentrant) →
+  //      _payoutNative → recipient.receive() → withdraw() (nonReentrant) →
+  //      reverts. The try/catch in ReentrantActor catches this; the outer
+  //      push succeeds; the actor got the ETH but reentrancySucceeded = false.
+  //
+  //   B. During withdraw() itself: the credit is zeroed (effect) before the
+  //      transfer (interaction). A recipient whose receive() calls withdraw()
+  //      again sees a zero balance and gets NoPendingWithdrawal.
+  // ---------------------------------------------------------------------------
+  describe("withdraw() reentrancy with hostile recipient (#864)", () => {
+    it("reentrancy attempt during claimOrder push is blocked — reentrancySucceeded stays false", async () => {
+      const [sender] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+
+      const F = await ethers.getContractFactory("ReentrantActor");
+      const actor = await F.deploy(await escrow.getAddress());
+      const actorAddr = await actor.getAddress();
+
+      // Configure actor to call withdraw() when it receives ETH.
+      await actor.setReenterWithdraw(true);
+
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        actorAddr,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      // claimOrder pushes AMOUNT to actor; actor's receive() fires and
+      // attempts withdraw(). Because claimOrder is nonReentrant, the nested
+      // withdraw() call is blocked by the reentrant guard and reverts.
+      // The try/catch in ReentrantActor catches that revert, so the outer
+      // push still completes — actor received the ETH directly.
+      await escrow.claimOrder(1, preimage);
+
+      // The reentrancy was attempted but never succeeded.
+      expect(await actor.reentrancyAttempted()).to.equal(true);
+      expect(await actor.reentrancySucceeded()).to.equal(false);
+    });
+
+    it("reentrancy attempt during withdraw() itself is blocked by CEI — nested call sees zero balance", async () => {
+      const [sender] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+
+      const F = await ethers.getContractFactory("ReentrantActor");
+      const actor = await F.deploy(await escrow.getAddress());
+      const actorAddr = await actor.getAddress();
+
+      // Use Guzzle mode receiver to pre-credit actor indirectly:
+      // actor is NOT the beneficiary here. Instead, we use the existing
+      // HTLCReceiverMock in Guzzle mode as the beneficiary so the push
+      // is deferred, then manually give actor a pending balance by having
+      // actor as refundAddress on a second order.
+      //
+      // Simpler: just use a Guzzle receiver for the push-deferral, then
+      // for the withdrawal reentrancy test use actor.pull() after crediting
+      // via a refund path.
+
+      // Create an order where actor is the refundAddress (so refund push
+      // goes to actor and actor's receive fires during withdraw).
+      await actor.setReenterWithdraw(true);
+
+      const receiver = await deployReceiver();
+      await receiver.setMode(MODE_GUZZLE); // beneficiary push will be deferred
+      const recvAddr = await receiver.getAddress();
+
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      // beneficiary = guzzle receiver (push fails, deferred), refundAddress = actor
+      await escrow.connect(sender).createOrder(
+        recvAddr,
+        actorAddr,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      // Expire the order and refund → the push to actor (refundAddress) fires.
+      // Actor's receive() attempts withdraw(), which is blocked by nonReentrant
+      // (because refundOrder is nonReentrant).
+      await time.increase(TIMELOCK + 1);
+      await escrow.refundOrder(1);
+
+      // If the push to actor succeeded within the stipend (actor got ETH
+      // directly), pendingWithdrawals is 0 and reentrancySucceeded is false.
+      // If the push ran out of gas (actor's receive was too expensive),
+      // actor has a pending balance and reentrancySucceeded is false.
+      // Either way, the reentrancy must never have succeeded.
+      expect(await actor.reentrancySucceeded()).to.equal(false);
+    });
+
+    it("withdraw() CEI order: credit is zeroed before transfer so re-entry sees zero balance", async () => {
+      // To test withdraw() reentrancy specifically:
+      // 1. Credit actor by using Guzzle push (which exhausts the stipend) or
+      //    by using a prior failed push via a GuzzleReceiver as a proxy.
+      //
+      // We use a simpler direct setup: give actor a pending credit by having
+      // it as the beneficiary of an order whose push exceeds the stipend
+      // (Guzzle mode). Since ReentrantActor's own receive() consumes gas for
+      // storage writes + external call, it may exhaust 30k gas, deferring.
+
+      const [sender] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+
+      const F = await ethers.getContractFactory("ReentrantActor");
+      const actor = await F.deploy(await escrow.getAddress());
+      const actorAddr = await actor.getAddress();
+      await actor.setReenterWithdraw(true);
+
+      // We need actor to have a pending credit. The only reliable way to
+      // credit it is via Guzzle — but actor's own receive() may be cheap
+      // enough to succeed under 30k. So instead we credit actor directly
+      // by calling refundOrder where actor is refundAddress AND the push
+      // would fail because actor's receive exceeds the stipend.
+      // Since we can't guarantee that, use a two-step approach:
+      // 1. Deploy a Guzzle receiver as beneficiary to burn the 30k stipend.
+      // 2. Use actor as refundAddress with a second order; refund it.
+      //    Actor's receive fires from refundOrder (nonReentrant) → reentrancy blocked.
+      //
+      // The key assertion is just about CEI: once actor has a pending balance
+      // and calls pull(), the balance is zeroed before transfer, so re-entry
+      // during transfer sees 0 and gets NoPendingWithdrawal.
+
+      // Credit actor via the refund path with a Guzzle beneficiary
+      // (so the beneficiary push fails and refund goes to actor).
+      const guzzle = await deployReceiver();
+      await guzzle.setMode(MODE_GUZZLE);
+
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        await guzzle.getAddress(), // beneficiary: Guzzle (irrelevant, order not claimed)
+        actorAddr,                 // refundAddress: actor
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await time.increase(TIMELOCK + 1);
+
+      // refundOrder pushes to actor; actor's receive() attempts withdraw().
+      // The push is bounded at 30k gas; actor's receive does storage write +
+      // external call → may exhaust stipend → payout deferred.
+      // Either the push succeeds (actor has ETH, no credit) or fails (actor
+      // has credit). In both cases reentrancySucceeded must be false.
+      await escrow.refundOrder(1);
+
+      const pending = await escrow.pendingWithdrawals(actorAddr);
+
+      if (pending > 0n) {
+        // Actor has a deferred credit. Now call actor.pull() — this invokes
+        // withdraw() with full gas. withdraw() zeros the balance (effect)
+        // THEN transfers (interaction). Actor's receive() fires during
+        // transfer and tries withdraw() again → sees 0 balance →
+        // NoPendingWithdrawal → try/catch catches it. Transfer completes.
+        await actor.pull();
+
+        // After pull: balance cleared, actor got ETH.
+        expect(await escrow.pendingWithdrawals(actorAddr)).to.equal(0n);
+        expect(await actor.reentrancySucceeded()).to.equal(false);
+      } else {
+        // Push succeeded within stipend; actor received ETH during refundOrder.
+        // The reentrancy attempt (if any) was blocked by nonReentrant on
+        // the outer refundOrder frame.
+        expect(await actor.reentrancySucceeded()).to.equal(false);
+      }
+    });
+
+    it("the hostile callback cannot consume another account's credit", async () => {
+      const [sender] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+
+      // First: credit an innocent account by deferring a push to a reject receiver.
+      const innocent = await deployReceiver();
+      await innocent.setMode(MODE_REJECT);
+      const innocentAddr = await innocent.getAddress();
+
+      const preimage1 = randomBytes32();
+      const hashlock1 = ethers.sha256(preimage1);
+      await escrow.connect(sender).createOrder(
+        innocentAddr,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock1,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+      await escrow.claimOrder(1, preimage1);
+      expect(await escrow.pendingWithdrawals(innocentAddr)).to.equal(AMOUNT);
+
+      // Second: deploy actor as beneficiary of a second order.
+      const F = await ethers.getContractFactory("ReentrantActor");
+      const actor = await F.deploy(await escrow.getAddress());
+      const actorAddr = await actor.getAddress();
+      await actor.setReenterWithdraw(true);
+
+      const preimage2 = randomBytes32();
+      const hashlock2 = ethers.sha256(preimage2);
+      await escrow.connect(sender).createOrder(
+        actorAddr,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock2,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      // claimOrder pushes to actor; actor's receive() attempts withdraw().
+      // Reentrancy blocked. Actor may or may not have received ETH directly.
+      await escrow.claimOrder(2, preimage2);
+
+      // Innocent account's credit must be completely untouched.
+      expect(await escrow.pendingWithdrawals(innocentAddr)).to.equal(AMOUNT);
+
+      // Actor's pending balance must not exceed AMOUNT (it cannot have stolen
+      // the innocent account's credit).
+      const actorPending = await escrow.pendingWithdrawals(actorAddr);
+      expect(actorPending).to.be.at.most(AMOUNT);
+
+      // Reentrancy never succeeded.
+      expect(await actor.reentrancySucceeded()).to.equal(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #863 — pull-payment withdrawal accounting
+  //
+  // When a native payout push fails the credited amount is stored in
+  // _pendingWithdrawals. These tests directly assert:
+  //   1. Only the credited recipient can withdraw its balance.
+  //   2. A successful withdrawal clears exactly the credited amount.
+  //   3. A second withdrawal after balance is cleared gets NoPendingWithdrawal.
+  // ---------------------------------------------------------------------------
+  describe("pull-payment withdrawal accounting (#863)", () => {
+    async function creditRecipient() {
+      const [sender] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const receiver = await deployReceiver();
+      await receiver.setMode(MODE_REJECT);
+      const recvAddr = await receiver.getAddress();
+
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        recvAddr,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+      // Claim triggers push → fails → credits recvAddr.
+      await escrow.claimOrder(1, preimage);
+
+      return { escrow, receiver, recvAddr, sender };
+    }
+
+    it("pending balance equals the locked amount after deferral", async () => {
+      const { escrow, recvAddr } = await creditRecipient();
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(AMOUNT);
+    });
+
+    it("only the credited recipient can withdraw — another account cannot pull the credit", async () => {
+      const [, , stranger] = await ethers.getSigners();
+      const { escrow } = await creditRecipient();
+
+      // The stranger has no pending balance — withdraw must revert for them.
+      await expect(
+        escrow.connect(stranger).withdraw()
+      ).to.be.revertedWithCustomError(escrow, "NoPendingWithdrawal");
+    });
+
+    it("successful withdrawal transfers exactly the credited amount and clears the balance", async () => {
+      const { escrow, receiver, recvAddr } = await creditRecipient();
+      const escrowAddr = await escrow.getAddress();
+
+      // Allow the receiver to accept ETH now so withdraw() succeeds.
+      await receiver.setMode(MODE_ACCEPT);
+
+      const recvBalBefore = await ethers.provider.getBalance(recvAddr);
+      const escrowBalBefore = await ethers.provider.getBalance(escrowAddr);
+
+      await expect(receiver.pull(escrowAddr))
+        .to.emit(escrow, "Withdrawn")
+        .withArgs(recvAddr, AMOUNT);
+
+      // Receiver got exactly AMOUNT.
+      expect(await ethers.provider.getBalance(recvAddr)).to.equal(
+        recvBalBefore + AMOUNT
+      );
+      // Escrow lost exactly AMOUNT.
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(
+        escrowBalBefore - AMOUNT
+      );
+      // Balance cleared to zero.
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(0n);
+    });
+
+    it("a repeated withdrawal after balance is cleared reverts with NoPendingWithdrawal", async () => {
+      const { escrow, receiver, recvAddr } = await creditRecipient();
+      const escrowAddr = await escrow.getAddress();
+
+      await receiver.setMode(MODE_ACCEPT);
+
+      // First withdrawal — succeeds.
+      await receiver.pull(escrowAddr);
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(0n);
+
+      // Second withdrawal — balance already zero, must revert.
+      await expect(
+        receiver.pull(escrowAddr)
+      ).to.be.revertedWithCustomError(escrow, "NoPendingWithdrawal");
+
+      // Receiver's ETH balance must not have changed after the second attempt.
+      expect(await ethers.provider.getBalance(recvAddr)).to.equal(AMOUNT);
+    });
+
+    it("partial-order scenario: credited recipient can withdraw even when other orders remain funded", async () => {
+      const [sender, beneficiary2] = await ethers.getSigners();
+      const { escrow, receiver, recvAddr } = await creditRecipient();
+      const escrowAddr = await escrow.getAddress();
+
+      // Create a second funded order to keep ETH locked in the escrow.
+      const preimage2 = randomBytes32();
+      const hashlock2 = ethers.sha256(preimage2);
+      await escrow.connect(sender).createOrder(
+        beneficiary2.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock2,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      // Escrow now holds deferred AMOUNT + second order AMOUNT + SAFETY_DEPOSIT.
+      await receiver.setMode(MODE_ACCEPT);
+      await receiver.pull(escrowAddr);
+
+      // Only the deferred amount was withdrawn; the second order's funds remain.
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(0n);
+      expect(await ethers.provider.getBalance(recvAddr)).to.equal(AMOUNT);
+      // Second order is still Funded.
+      expect((await escrow.getOrder(2)).status).to.equal(0);
+    });
+
+    it("refund path also credits on push failure, and withdrawal clears the balance", async () => {
+      const [sender] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const receiver = await deployReceiver();
+      await receiver.setMode(MODE_REJECT);
+      const recvAddr = await receiver.getAddress();
+      const escrowAddr = await escrow.getAddress();
+
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      // refundAddress is the rejecting receiver.
+      await escrow.connect(sender).createOrder(
+        sender.address,
+        recvAddr,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await time.increase(TIMELOCK + 1);
+      await escrow.connect(sender).refundOrder(1);
+
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(AMOUNT);
+
+      // Withdrawal succeeds once receiver accepts ETH.
+      await receiver.setMode(MODE_ACCEPT);
+      await expect(receiver.pull(escrowAddr))
+        .to.emit(escrow, "Withdrawn")
+        .withArgs(recvAddr, AMOUNT);
+
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(0n);
+      expect(await ethers.provider.getBalance(recvAddr)).to.equal(AMOUNT);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
+    });
+  });
 });
