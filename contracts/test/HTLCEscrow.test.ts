@@ -1459,4 +1459,147 @@ describe("HTLCEscrow v2", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Issue #869 — duplicate claim/refund attempt tests
+  // ---------------------------------------------------------------------------
+  describe("duplicate finalization attempts (#869)", () => {
+    // Helper: create a funded native-ETH order and return its id along with
+    // the escrow instance, preimage, and signers.
+    async function setupFundedOrder() {
+      const [sender, beneficiary, relayer] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+      return { escrow, preimage, sender, beneficiary, relayer, orderId: 1n };
+    }
+
+    it("second claimOrder on the same order reverts with OrderNotClaimable, no funds move", async () => {
+      const { escrow, preimage, beneficiary, orderId } = await setupFundedOrder();
+      const escrowAddr = await escrow.getAddress();
+
+      // First claim succeeds.
+      await escrow.connect(beneficiary).claimOrder(orderId, preimage);
+      expect((await escrow.getOrder(orderId)).status).to.equal(1); // Claimed
+
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      // Second claim must revert.
+      await expect(
+        escrow.connect(beneficiary).claimOrder(orderId, preimage)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotClaimable");
+
+      // No funds left the contract on the duplicate attempt (balance unchanged).
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+
+      // Only one OrderClaimed event was ever emitted for this order id.
+      const filter = escrow.filters.OrderClaimed(orderId);
+      const events = await escrow.queryFilter(filter);
+      expect(events.length).to.equal(1);
+    });
+
+    it("refundOrder after a successful claim reverts with OrderNotRefundable, no funds move", async () => {
+      const { escrow, preimage, beneficiary, sender, orderId } = await setupFundedOrder();
+      const escrowAddr = await escrow.getAddress();
+
+      // Claim the order first.
+      await escrow.connect(beneficiary).claimOrder(orderId, preimage);
+      expect((await escrow.getOrder(orderId)).status).to.equal(1); // Claimed
+
+      // Advance time past the timelock so a refund would otherwise be valid.
+      await time.increase(TIMELOCK + 1);
+
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      // Refund after claim must revert.
+      await expect(
+        escrow.connect(sender).refundOrder(orderId)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotRefundable");
+
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+
+      // No OrderRefunded event was emitted.
+      const filter = escrow.filters.OrderRefunded(orderId);
+      const events = await escrow.queryFilter(filter);
+      expect(events.length).to.equal(0);
+    });
+
+    it("second refundOrder on the same order reverts with OrderNotRefundable, no funds move", async () => {
+      const { escrow, sender, orderId } = await setupFundedOrder();
+      const escrowAddr = await escrow.getAddress();
+
+      // Advance past expiry and execute the first refund.
+      await time.increase(TIMELOCK + 1);
+      await escrow.connect(sender).refundOrder(orderId);
+      expect((await escrow.getOrder(orderId)).status).to.equal(2); // Refunded
+
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      // Second refund attempt must revert.
+      await expect(
+        escrow.connect(sender).refundOrder(orderId)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotRefundable");
+
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+
+      // Exactly one OrderRefunded event for this order.
+      const filter = escrow.filters.OrderRefunded(orderId);
+      const events = await escrow.queryFilter(filter);
+      expect(events.length).to.equal(1);
+    });
+
+    it("claimOrder after a successful refund reverts with OrderNotClaimable, no funds move", async () => {
+      const { escrow, preimage, sender, beneficiary, orderId } = await setupFundedOrder();
+      const escrowAddr = await escrow.getAddress();
+
+      // Refund the order first.
+      await time.increase(TIMELOCK + 1);
+      await escrow.connect(sender).refundOrder(orderId);
+      expect((await escrow.getOrder(orderId)).status).to.equal(2); // Refunded
+
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      // Claim after refund must revert — even with a valid preimage.
+      await expect(
+        escrow.connect(beneficiary).claimOrder(orderId, preimage)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotClaimable");
+
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+
+      // No OrderClaimed event was emitted.
+      const filter = escrow.filters.OrderClaimed(orderId);
+      const events = await escrow.queryFilter(filter);
+      expect(events.length).to.equal(0);
+    });
+
+    it("finalisedAt is set exactly once and is not overwritten by a duplicate attempt", async () => {
+      const { escrow, preimage, beneficiary, sender, orderId } = await setupFundedOrder();
+
+      // Claim the order.
+      await escrow.connect(beneficiary).claimOrder(orderId, preimage);
+      const finalisedAt = (await escrow.getOrder(orderId)).finalisedAt;
+      expect(finalisedAt).to.be.greaterThan(0n);
+
+      // Advance past expiry so a refund would conceptually be eligible.
+      await time.increase(TIMELOCK + 1);
+
+      // Duplicate refund attempt should revert.
+      await expect(
+        escrow.connect(sender).refundOrder(orderId)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotRefundable");
+
+      // finalisedAt is unchanged.
+      expect((await escrow.getOrder(orderId)).finalisedAt).to.equal(finalisedAt);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
 });
