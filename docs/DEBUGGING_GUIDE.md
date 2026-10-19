@@ -10,7 +10,8 @@ to deeper docs are provided at each decision point.
 
 For service health endpoint contracts, see [`docs/HEALTH_DASHBOARD.md`](./HEALTH_DASHBOARD.md).  
 For rollback procedures, see [`docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md`](./DEPLOYMENT_ROLLBACK_RUNBOOK.md).  
-For production ops checklist, see [`docs/OPERATIONS.md`](./OPERATIONS.md).
+For production ops checklist, see [`docs/OPERATIONS.md`](./OPERATIONS.md).  
+For definitions and examples of `publicId`, on-chain `orderId`, and `hashlock`/`orderHash`, see [`docs/IDENTIFIER_GLOSSARY.md`](./IDENTIFIER_GLOSSARY.md).
 
 ---
 
@@ -451,13 +452,15 @@ jq 'select(.msg | test("reconcil"))' < coordinator.log
 
 **Key Pino log fields:**
 
+For full definitions, examples, and the relationship between all three identifiers, see [`docs/IDENTIFIER_GLOSSARY.md`](./IDENTIFIER_GLOSSARY.md).
+
 | Field | Meaning |
 |---|---|
 | `level` | 10=trace, 20=debug, 30=info, 40=warn, 50=error, 60=fatal |
 | `reqId` | Per-request ID (from pino-http) |
-| `publicId` | Order public ID (primary correlation key) |
-| `orderId` | Internal DB row ID |
-| `hashlock` | Order hashlock (safe to log — not secret) |
+| `publicId` | Order public ID — `wf_0x<hashlock>` (primary cross-service correlation key) |
+| `orderId` | Internal DB row ID (not the on-chain numeric order ID) |
+| `hashlock` | Order hashlock — 0x-prefixed bytes32 (safe to log — not the preimage) |
 | `chain` | Which chain the event originated from |
 | `component` | Which internal module emitted the log |
 
@@ -478,7 +481,13 @@ Full Prometheus scrape endpoint: `GET /metrics` (requires `COORDINATOR_OPERATOR_
 
 ### Relayer (console.log — unstructured)
 
-The relayer does not produce structured JSON (TD-051). Filter by text patterns:
+The relayer does not produce structured JSON (TD-051). Filter by text patterns.
+
+> **Identifier note:** `orderId=` in relayer logs refers to the Ethereum HTLC
+> contract's `uint256` event arg. `orderHash=` refers to the hashlock bytes32.
+> These are distinct from the coordinator's `publicId`. See
+> [`docs/IDENTIFIER_GLOSSARY.md`](./IDENTIFIER_GLOSSARY.md) for the full
+> relationship and a cross-service correlation recipe.
 
 ```bash
 # All errors and warnings
