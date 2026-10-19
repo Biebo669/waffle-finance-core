@@ -104,7 +104,60 @@ The script covers (see `scripts/README.md` for the full step list):
 
 ---
 
-## 5. Documentation
+## 5. Mainnet audit gate
+
+**A green build does not authorize mainnet traffic.** Mainnet deployment
+requires all three conditions below to be satisfied independently — they are
+not implied by CI passing or by testnet deployments succeeding.
+
+### 5a. Independent security audit sign-off
+
+- [ ] An independent security audit has been completed for every contract or
+  security-relevant module in this release (see
+  [`docs/RELEASE_CHECKLIST_MULTI_PACKAGE.md` Part 4 — Critical risk](../docs/RELEASE_CHECKLIST_MULTI_PACKAGE.md)
+  for which changes require this gate).
+- [ ] Audit approval has been received in writing from the auditor. Record
+  the approval reference (report ID, date, and auditor name) here:
+
+  > **Audit reference:** _______________________________________________
+
+  Do **not** embed private audit material in this file; record only the
+  reference identifier. The full report is stored separately.
+
+- [ ] All critical and high-severity findings from the audit are resolved or
+  have an accepted risk sign-off from both the release owner and a second
+  engineer.
+
+### 5b. Mainnet-gating flags and configuration
+
+The following flags and env vars remain **disabled / unset** until audit
+approval in 5a is confirmed. Verify each before enabling mainnet traffic:
+
+| Flag / env var | Where it lives | Default | Action before enabling mainnet |
+|---|---|---|---|
+| `VITE_MAINNET_ENABLED` | Frontend build env (`packages/config/src/index.ts`) | `false` / unset | Set to `'true'` only after audit sign-off; requires a production rebuild |
+| `NETWORK_MODE` | Resolver + relayer runtime env | `testnet` | Change to `mainnet` only after audit sign-off and contract addresses verified |
+| `SOROBAN_HTLC_MAINNET` | Relayer runtime env | unset (required when `NETWORK_MODE=mainnet`) | Populate with the audited mainnet contract address |
+| `RELAYER_STELLAR_SECRET_MAINNET` | Relayer runtime env | unset | Populate only in a secure secrets store; never commit |
+
+- [ ] `VITE_MAINNET_ENABLED` confirmed `false` (or unset) in all non-mainnet
+  deployments; the frontend test `src/config/networks.test.ts` asserts this
+  default.
+- [ ] `NETWORK_MODE` is `testnet` in every pre-mainnet environment config.
+- [ ] `SOROBAN_HTLC_MAINNET` and `RELAYER_STELLAR_SECRET_MAINNET` are absent
+  from any testnet deployment's secrets store.
+
+### 5c. Testnet vs mainnet — explicit distinction
+
+- [ ] This release has been deployed to testnet and validated there before any
+  mainnet configuration is touched.
+- [ ] The distinction between "testnet deployment ready" and "mainnet traffic
+  enabled" has been confirmed with the release owner and documented in the
+  release notes.
+
+---
+
+## 6. Documentation
 
 - [ ] `CHANGELOG.md` updated with release notes (if applicable).
 - [ ] `README.md` updated if user-facing behaviour changed.
@@ -115,7 +168,7 @@ The script covers (see `scripts/README.md` for the full step list):
 
 ---
 
-## 6. Version and manifest
+## 7. Version and manifest
 
 - [ ] All package versions bumped consistently (`pnpm version X.Y.Z -ws`).
 - [ ] Version follows semantic versioning per `RELEASE_POLICY.md`.
@@ -125,7 +178,7 @@ The script covers (see `scripts/README.md` for the full step list):
 
 ---
 
-## 7. Create and push the tag
+## 8. Create and push the tag
 
 ```bash
 # Annotated tag — include a brief summary of what changed
