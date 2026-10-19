@@ -10,6 +10,7 @@ import {
   activeListeners,
 } from '../metrics.js';
 import { globalStalenessMonitor } from '../telemetry.js';
+import { resolveSolanaListenerConfig } from '../solana-config.js';
 
 const CHAIN = 'solana';
 
@@ -321,11 +322,11 @@ export class SolanaListener {
   async start(handlers: SolanaEventHandlers): Promise<void> {
     const programId = this.cfg.solana?.programId;
 
-    if (!programId || isProgramIdPlaceholder(programId)) {
-      this.log.warn(
-        { programId },
-        'SOLANA_HTLC_PROGRAM is a placeholder — Solana listener disabled'
-      );
+    // Placeholder → disabled (never a healthy live integration);
+    // malformed → throws here, failing before listener startup.
+    const resolution = resolveSolanaListenerConfig({ programId });
+    if (resolution.mode === 'disabled') {
+      this.log.warn({ programId }, resolution.reason);
       return;
     }
 
@@ -561,27 +562,4 @@ export class SolanaListener {
     }
     this.processedSigs.set(sig, true);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Internal helper
-// ---------------------------------------------------------------------------
-
-/** Mirrors the coordinator's isSolanaPlaceholder logic inline to avoid
- *  importing @wafflefinance/config from the resolver (which has no Solana
- *  section in its config schema yet). */
-function isProgramIdPlaceholder(programId: string | undefined): boolean {
-  if (!programId || programId.trim() === '') return true;
-  const upper = programId.trim().toUpperCase();
-  const known = new Set([
-    'PLACEHOLDER',
-    'YOUR_SOLANA_HTLC_PROGRAM',
-    'YOUR_SOLANA_PROGRAM',
-    'YOUR_PROGRAM_ID',
-    '11111111111111111111111111111111',
-  ]);
-  for (const k of known) {
-    if (upper === k) return true;
-  }
-  return upper.includes('PLACEHOLDER') || upper.startsWith('YOUR_');
 }
