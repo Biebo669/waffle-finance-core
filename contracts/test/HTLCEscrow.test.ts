@@ -454,6 +454,150 @@ describe("HTLCEscrow v2", () => {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // Issue #862 — zero safety-deposit order creation
+  // ---------------------------------------------------------------------------
+  describe("createOrder — zero safety deposit (#862)", () => {
+    it("accepts a zero safety deposit when minSafetyDeposit is zero (native ETH)", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow(); // deployed with minSafetyDeposit = 0
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      // With zero safety deposit, msg.value must equal amount exactly.
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          ZERO_ADDR,
+          AMOUNT,
+          0, // zero safety deposit
+          hashlock,
+          TIMELOCK,
+          { value: AMOUNT }
+        )
+      ).to.not.be.reverted;
+
+      const order = await escrow.getOrder(1);
+      expect(order.amount).to.equal(AMOUNT);
+      expect(order.safetyDeposit).to.equal(0n);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(AMOUNT);
+    });
+
+    it("accepts a zero safety deposit for an ERC20 order (msg.value = 0)", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployToken();
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await token.connect(sender).approve(await escrow.getAddress(), AMOUNT);
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          await token.getAddress(),
+          AMOUNT,
+          0, // zero safety deposit
+          hashlock,
+          TIMELOCK,
+          { value: 0 } // no ETH needed: amount in token, deposit is zero
+        )
+      ).to.not.be.reverted;
+
+      expect(await token.balanceOf(await escrow.getAddress())).to.equal(AMOUNT);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(0n);
+    });
+
+    it("rejects a zero safety deposit when minSafetyDeposit > 0", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const HTLCEscrowFactory = await ethers.getContractFactory("HTLCEscrow");
+      const escrow = (await HTLCEscrowFactory.deploy(
+        ZERO_ADDR,
+        ethers.parseEther("0.001") // non-zero minimum
+      )) as unknown as HTLCEscrow;
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          ZERO_ADDR,
+          AMOUNT,
+          0, // zero — below the non-zero minimum
+          randomBytes32(),
+          TIMELOCK,
+          { value: AMOUNT }
+        )
+      ).to.be.revertedWithCustomError(escrow, "SafetyDepositTooSmall");
+
+      // No order was created.
+      expect(await escrow.nextOrderId()).to.equal(1n);
+    });
+
+    it("pays no safety-deposit incentive on claim when deposit is zero", async () => {
+      const [sender, beneficiary, relayer] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        0, // zero safety deposit
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT }
+      );
+
+      const beneficiaryBefore = await ethers.provider.getBalance(beneficiary.address);
+      const relayerBefore = await ethers.provider.getBalance(relayer.address);
+
+      await escrow.connect(relayer).claimOrder(1, preimage);
+
+      // Beneficiary receives the full amount; relayer gets no deposit.
+      expect(await ethers.provider.getBalance(beneficiary.address)).to.equal(
+        beneficiaryBefore + AMOUNT
+      );
+      // Relayer only paid gas — no safety deposit credited.
+      expect(await escrow.pendingWithdrawals(relayer.address)).to.equal(0n);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(0n);
+    });
+
+    it("pays no safety-deposit incentive on refund when deposit is zero", async () => {
+      const [sender, beneficiary, caller] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+      const refundAddr = ethers.Wallet.createRandom().address;
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        refundAddr,
+        ZERO_ADDR,
+        AMOUNT,
+        0, // zero safety deposit
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT }
+      );
+
+      await time.increase(TIMELOCK + 1);
+
+      const refundBefore = await ethers.provider.getBalance(refundAddr);
+
+      await escrow.connect(caller).refundOrder(1);
+
+      // Refund address receives principal; caller gets no deposit.
+      expect(await ethers.provider.getBalance(refundAddr)).to.equal(
+        refundBefore + AMOUNT
+      );
+      expect(await escrow.pendingWithdrawals(caller.address)).to.equal(0n);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(0n);
+    });
+  });
+
   describe("setResolverRegistry", () => {
     it("rejects the zero address — a zero registry would silently disable the sybil gate without an explicit deployment decision", async () => {
       const [owner] = await ethers.getSigners();
