@@ -124,6 +124,7 @@ on any package that imports it (`pnpm --filter @wafflefinance/sdk build`).
 | Script | Command | Validates |
 | --- | --- | --- |
 | `test` | `vitest run` | Cross-package flows against running services |
+| `test:smoke` | `vitest run cross-chain.test.ts solana-settlement.test.ts solana-timeout-refund.test.ts lifecycle-cases.test.ts` | Deterministic local degraded-mode subset: timeout, duplicate-event (double-claim/refund idempotency), and recovery/backstop-refund cases — no wallets or RPC endpoints |
 | `test:watch` | `vitest` | Watch mode |
 | `lint` | `eslint src --ext .ts` | ESLint over the test sources |
 
@@ -146,6 +147,11 @@ TypeScript-bindings generation.
 
 ## Smoke tests
 
+- **Degraded-mode local smoke (no wallets, no RPC):**
+  `pnpm --filter @wafflefinance/e2e test:smoke` runs the fast deterministic
+  subset (timeout, duplicate-event, and recovery/backstop cases). It exits
+  non-zero and names the failing case on any scenario failure. Run this
+  before changing recovery or listener code.
 - **Coordinator:** start it (`pnpm coordinator:dev`), then `pnpm health:check`
   hits `GET /health` on port 3001.
 - **Frontend:** `pnpm frontend:build && pnpm frontend:preview` serves the real
