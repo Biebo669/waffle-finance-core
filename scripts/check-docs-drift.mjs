@@ -43,6 +43,7 @@ const SCAN_EXCLUDE_DIRS = new Set([
   '.git',
   'contracts/lib',   // vendored forge-std — not our docs to validate
   'soroban/target',  // Rust build output
+  'scripts/test',    // unit-test fixtures — intentionally contain broken links
 ]);
 
 /** Link target prefixes that are always external — skip filesystem check. */

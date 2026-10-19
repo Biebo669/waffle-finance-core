@@ -267,6 +267,50 @@ package's own test suite:
 
 ---
 
+## CI vs local — what a green PR actually proves
+
+CI runs only a subset of the repo's checks. Before opening a PR, understand
+which checks are automated and which are local-only.
+
+**Runs on every push and every PR (no path filter):**
+
+| Check | Command |
+|---|---|
+| Command contract | `pnpm validate:commands` → [`command-contract.yml`](../.github/workflows/command-contract.yml) |
+
+**Runs only when the matching paths are touched:**
+
+| Check | Trigger paths | Command |
+|---|---|---|
+| Foundry fuzz + invariant tests | `contracts/**` | `cd contracts && forge test` → [`foundry-contracts.yml`](../.github/workflows/foundry-contracts.yml) |
+| Soroban cargo test | `soroban/**` | `cd soroban && cargo test` → [`soroban-contracts.yml`](../.github/workflows/soroban-contracts.yml) |
+| Frontend Vitest + type-check + lint | `frontend/**`, `packages/sdk/**`, `packages/config/**` | `pnpm --filter @wafflefinance/frontend test` → [`frontend.yml`](../.github/workflows/frontend.yml) |
+| Dependency CVE + licence scan | `pnpm-lock.yaml`, any `package.json` | GitHub action → [`dep-review.yml`](../.github/workflows/dep-review.yml) |
+| Cross-package dep-version alignment | same as above | `pnpm validate:deps` → [`dep-review.yml`](../.github/workflows/dep-review.yml) |
+
+**Local only — no CI job, must run manually before opening a PR:**
+
+| Check | Command |
+|---|---|
+| Coordinator tests | `pnpm --filter @wafflefinance/coordinator test` |
+| Relayer tests | `pnpm --filter @wafflefinance/relayer test` |
+| Resolver tests | `pnpm --filter @wafflefinance/resolver test` |
+| SDK build + tests | `pnpm --filter @wafflefinance/sdk build && pnpm --filter @wafflefinance/sdk test` |
+| Hardhat contract tests (Node driver) | `pnpm --filter @wafflefinance/contracts test` |
+| Deployment manifest validation | `pnpm validate:deployments` |
+| Doc-drift + stale links | `pnpm validate:docs` |
+| Release verification | `scripts/verify-release-locally.sh` |
+| E2E cross-chain suite | `pnpm test:e2e` |
+
+A PR that only touches `coordinator/` or `relayer/` will receive **no
+automatic test coverage** — those packages have no dedicated CI job. Always
+run their test suites locally before opening the PR.
+
+See [`docs/COMMANDS.md`](./COMMANDS.md) for the full command reference and
+the canonical CI vs local table.
+
+---
+
 ## Before you open a PR
 
 1. Run the validation checklist for every package you touched, not just the

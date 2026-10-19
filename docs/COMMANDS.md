@@ -182,3 +182,42 @@ Related but separate: `pnpm validate:manifests` checks manifest names,
 versions, and export paths. Note it verifies built artifacts referenced by
 `exports`, so it needs `pnpm --filter @wafflefinance/sdk build` (or a full
 `pnpm build`) to have run first.
+
+---
+
+## CI vs local — which checks run where
+
+Use this table to understand what a green PR actually proves and what you
+still need to verify locally before opening one.
+
+| Check | Command | When it runs | Workflow / job |
+|---|---|---|---|
+| Command contract (scripts match docs) | `pnpm validate:commands` | Every push + PR | [`command-contract.yml`](../.github/workflows/command-contract.yml) → `validate` |
+| Foundry fuzz + invariant tests | `cd contracts && forge test` | Push/PR to `contracts/**` | [`foundry-contracts.yml`](../.github/workflows/foundry-contracts.yml) → `foundry` |
+| Soroban cargo test + property fuzz | `cd soroban && cargo test` | Push/PR to `soroban/**` | [`soroban-contracts.yml`](../.github/workflows/soroban-contracts.yml) → `test` |
+| Frontend Vitest (testnet + mainnet legs) | `pnpm --filter @wafflefinance/frontend test` | Push/PR to `frontend/**`, `packages/sdk/**`, `packages/config/**` | [`frontend.yml`](../.github/workflows/frontend.yml) → `vitest` |
+| Frontend TypeScript type-check | `pnpm --filter @wafflefinance/frontend build` | Same path filter as above | [`frontend.yml`](../.github/workflows/frontend.yml) → `typecheck` |
+| Frontend ESLint | `pnpm --filter @wafflefinance/frontend lint` | Same path filter as above | [`frontend.yml`](../.github/workflows/frontend.yml) → `lint` |
+| Dependency CVE + licence scan | — (GitHub action, no local equivalent) | PRs touching `pnpm-lock.yaml` or any `package.json` | [`dep-review.yml`](../.github/workflows/dep-review.yml) → `dependency-review` |
+| Cross-package dep-version alignment | `pnpm validate:deps` | Same path filter as dep-review | [`dep-review.yml`](../.github/workflows/dep-review.yml) → `validate-deps` |
+| **Coordinator tests** | `pnpm --filter @wafflefinance/coordinator test` | **Local only — no CI job** | — |
+| **Relayer tests** | `pnpm --filter @wafflefinance/relayer test` | **Local only — no CI job** | — |
+| **Resolver tests** | `pnpm --filter @wafflefinance/resolver test` | **Local only — no CI job** | — |
+| **SDK build + tests** | `pnpm --filter @wafflefinance/sdk build && pnpm --filter @wafflefinance/sdk test` | **Local only — no CI job** | — |
+| **Hardhat contract tests** (Node driver) | `pnpm --filter @wafflefinance/contracts test` | **Local only — no CI job** | — |
+| **Deployment manifest validation** | `pnpm validate:deployments` | **Local only — no CI job** | — |
+| **Doc-drift + stale links** | `pnpm validate:docs` | **Local only — no CI job** | — |
+| **Release verification** | `scripts/verify-release-locally.sh` | **Local only — no CI job** | — |
+| **E2E cross-chain suite** | `pnpm test:e2e` | **Local only — no CI job** | — |
+
+**Key takeaways:**
+
+- CI only runs the command contract, Foundry/Soroban contract tests,
+  frontend suite, and dependency review. Everything else is local only.
+- A green PR does **not** mean coordinator, relayer, resolver, or SDK tests
+  passed — you must run those locally before opening a PR if you touched
+  those packages.
+- Path filters mean CI is skipped entirely for a PR that only touches
+  `coordinator/` or `relayer/` — those packages have no dedicated CI job.
+- `pnpm validate:deployments` and `pnpm validate:docs` must be run manually;
+  they catch manifest and doc drift that CI does not detect.
