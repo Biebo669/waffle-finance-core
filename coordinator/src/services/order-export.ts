@@ -64,7 +64,8 @@ export interface OrderLifecycleExport {
   /** Secret reveal details (if revealed) */
   secret: {
     revealed: boolean;
-    preimage: string | null;
+    /** Always null: preimages are excluded from compliance exports. */
+    preimage: null;
     revealedTx: string | null;
   };
 
@@ -144,6 +145,19 @@ export interface OrderExportResult {
   };
 }
 
+function omitPreimages(payload: Record<string, unknown>): Record<string, unknown> {
+  const clean = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(clean);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).filter(([key]) =>
+        !/preimage|secret/i.test(key)
+      ).map(([key, entry]) => [key, clean(entry)]));
+    }
+    return value;
+  };
+  return clean(payload) as Record<string, unknown>;
+}
+
 export class OrderExportService {
   constructor(
     private readonly ordersRepo: OrdersRepository,
@@ -213,13 +227,14 @@ export class OrderExportService {
       try {
         payload = JSON.parse(entry.payloadJson);
       } catch {
-        payload = { raw: entry.payloadJson };
+        // Malformed raw JSON may still contain a preimage; never echo it.
+        payload = { parseError: true };
       }
 
       return {
         type: entry.eventType,
         timestamp: entry.createdAt,
-        payload,
+        payload: omitPreimages(payload),
         requestId: entry.requestId ?? undefined,
       };
     });
@@ -261,7 +276,7 @@ export class OrderExportService {
       },
       secret: {
         revealed: order.preimage !== null,
-        preimage: order.preimage,
+        preimage: null,
         revealedTx: order.secretRevealedTx,
       },
       timestamps: {

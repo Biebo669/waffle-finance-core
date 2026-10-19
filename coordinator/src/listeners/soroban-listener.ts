@@ -129,6 +129,7 @@ export class SorobanListener {
   private readonly log: Logger;
   private cursor: string | undefined;
   private stopped = false;
+  private startingOrStarted = false;
   private lastProcessedLedger = 0;
   /** The HTLC contract this listener is bound to; set in start(). */
   private contractId: string | undefined;
@@ -157,6 +158,7 @@ export class SorobanListener {
   }
 
   start(): void {
+    if (this.startingOrStarted) return;
     if (!this.cfg.soroban.htlcContract) {
       this.log.warn(
         "SOROBAN_HTLC contract not configured - Soroban listener disabled"
@@ -164,6 +166,7 @@ export class SorobanListener {
       return;
     }
     const contractId = this.cfg.soroban.htlcContract;
+    this.startingOrStarted = true;
     this.contractId = contractId;
     this.log.info({ contract: contractId }, "starting");
     void this.bootstrapAndLoop(contractId);

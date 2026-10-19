@@ -183,13 +183,13 @@ describe("OrderExportService", () => {
       // Assert
       expect(exported!.status).toBe("secret_revealed");
       expect(exported!.secret.revealed).toBe(true);
-      expect(exported!.secret.preimage).toBe("0xPreimage123");
+      expect(exported!.secret.preimage).toBeNull();
       expect(exported!.secret.revealedTx).toBe("0xRevealTxHash");
 
       // Check events include reveal
       const revealEvent = exported!.events.find((e) => e.type === "order.secret_revealed");
       expect(revealEvent).toBeDefined();
-      expect(revealEvent!.payload.preimage).toBe("0xPreimage123");
+      expect(revealEvent!.payload).not.toHaveProperty("preimage");
     });
   });
 
