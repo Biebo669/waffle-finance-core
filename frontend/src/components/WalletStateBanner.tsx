@@ -425,6 +425,7 @@ export default function WalletStateBanner({ walletState }: WalletStateBannerProp
                   onClick={() => {
                     banner.onAction?.();
                   }}
+                  aria-label={banner.actionLabel}
                   className={`text-xs font-semibold px-3 py-1 rounded-full border transition-colors
                     ${meta.borderClass} bg-white/5 hover:bg-white/10 text-white`}
                 >
