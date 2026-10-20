@@ -20,11 +20,45 @@ then use those two as reference while you work.
 ## Table of contents
 
 - [The one rule](#the-one-rule)
+- [Package ownership map](#package-ownership-map)
 - [Package boundaries](#package-boundaries)
 - [Where do I make this change?](#where-do-i-make-this-change)
 - [Per-package validation checklist](#per-package-validation-checklist)
 - [Cross-package coupling you can't see from one package](#cross-package-coupling-you-cant-see-from-one-package)
 - [Before you open a PR](#before-you-open-a-pr)
+
+---
+
+## Package ownership map
+
+Use this table as the fastest route from a behavior to the package that owns
+it, its primary responsibility, and the first command to run after a change.
+Every active workspace package is listed once; commands that exist only in
+`docs/COMMANDS.md` are cross-referenced, not duplicated.
+
+| Package | Directory | Primary responsibility | Focused test command | Guide |
+|---|---|---|---|---|
+| `@wafflefinance/contracts` | `contracts/` | Solidity HTLCEscrow + ResolverRegistry (EVM settlement source of truth) | `pnpm --filter @wafflefinance/contracts test` | [contracts/README.md](../contracts/README.md) |
+| Soroban contracts | `soroban/` | Rust HTLC + ResolverRegistry (Stellar settlement source of truth). **Not a pnpm package.** | `cd soroban && cargo test` | [soroban/README.md](../soroban/README.md) |
+| `@wafflefinance/sdk` | `packages/sdk/` | Chain-agnostic client surface (IHTLCClient adapters, state machine, asset resolution, coordinator REST client). Build before running any service that imports it. | `pnpm --filter @wafflefinance/sdk build && pnpm --filter @wafflefinance/sdk test` | — |
+| `@wafflefinance/config` | `packages/config/` | Shared env-var validation and typed config for all TS packages | `pnpm --filter @wafflefinance/config build` | — |
+| `@wafflefinance/coordinator` | `coordinator/` | Order book service — REST API, order state machine, per-chain event listeners, reconciliation/replay, stale-order cleanup | `pnpm --filter @wafflefinance/coordinator test` | [coordinator/README.md](../coordinator/README.md) |
+| `@wafflefinance/relayer` | `relayer/` | Bridge relay — creates/processes swap orders, refund watchdog, gas tracking, mainnet Stellar signing | `pnpm --filter @wafflefinance/relayer test` | [relayer/README.md](../relayer/README.md) |
+| `@wafflefinance/resolver` | `resolver/` | Open-source resolver runner — pure listener + relay, no order store, supervises its own listener lifecycle | `pnpm --filter @wafflefinance/resolver test` | [resolver/README.md](../resolver/README.md) |
+| `@wafflefinance/frontend` | `frontend/` | React + Vite dApp — wallet connection, bridge form, client-side order polling | `pnpm --filter @wafflefinance/frontend test` | [frontend/README.md](../frontend/README.md) |
+| `@wafflefinance/e2e` | `e2e/` | In-memory cross-chain differential test harness (no real RPCs or running services) | `pnpm test:e2e` (or `pnpm --filter @wafflefinance/e2e test`) | — |
+| `@wafflefinance/dashboard` | `packages/dashboard/` | Aggregates `/health`, `/healthz`, `/readyz` across services | `pnpm --filter @wafflefinance/dashboard build` | — |
+
+**Notes:**
+- All `pnpm --filter` commands above match the script names in
+  [`docs/COMMANDS.md`](./COMMANDS.md); `pnpm validate:commands` enforces
+  they remain accurate.
+- "Focused" means the smallest meaningful check for that package — it does
+  not replace the full suite or cross-package verification. See the
+  [Per-package validation checklist](#per-package-validation-checklist)
+  below for what each green run proves and does not prove.
+- Soroban is a Cargo workspace outside the pnpm workspace; no `pnpm` command
+  reaches it. All commands for Soroban run from the `soroban/` directory.
 
 ---
 

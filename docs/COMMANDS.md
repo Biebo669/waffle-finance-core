@@ -30,6 +30,73 @@ The coordinator suite passing says nothing about the relayer; a green Hardhat
 run says nothing about the Soroban contracts. Cross-package behaviour is only
 covered by the e2e suite (`pnpm test:e2e`).
 
+## Focused test runs
+
+These examples target a single file or test name without running the whole
+package suite. They complement — not replace — the suite commands above.
+
+### TypeScript services (coordinator, relayer, resolver, frontend, e2e)
+
+The `test` script for these packages is `vitest run`. Pass extra arguments
+after `--` to scope the run:
+
+```bash
+# Run a single test file (coordinator example; substitute any service filter)
+pnpm --filter @wafflefinance/coordinator exec vitest run src/services/order-service.test.ts
+
+# Run only tests whose name matches a pattern (-t accepts a substring or regex)
+pnpm --filter @wafflefinance/coordinator exec vitest run -t "recordSrcLock"
+
+# Same pattern for the relayer or resolver
+pnpm --filter @wafflefinance/relayer exec vitest run src/services/recovery-service.test.ts
+pnpm --filter @wafflefinance/resolver exec vitest run -t "cursor"
+```
+
+> These run the same `vitest run` that the `test` script uses — focused runs
+> do not bypass or replace the suite.
+
+### Solidity contracts (Hardhat)
+
+```bash
+# Run a single test file
+pnpm --filter @wafflefinance/contracts exec hardhat test test/HTLCEscrow.test.ts
+
+# Filter by test name with --grep (substring or regex)
+pnpm --filter @wafflefinance/contracts exec hardhat test --grep "claim with valid preimage"
+```
+
+> Build step: `pnpm --filter @wafflefinance/contracts build` (or
+> `pnpm --filter @wafflefinance/contracts compile`) must have run first so
+> Hardhat finds the compiled artifacts.
+
+### Soroban contracts (Cargo)
+
+```bash
+# Run a single test function
+cd soroban && cargo test test_claim_with_valid_preimage
+
+# Run all tests in a module
+cd soroban && cargo test htlc::
+
+# Show stdout for a single test
+cd soroban && cargo test test_refund_after_timelock -- --nocapture
+```
+
+> Soroban contracts are a Cargo workspace outside the pnpm workspace; no
+> `pnpm` command reaches them. Run all commands from the `soroban/` directory.
+
+### SDK — prerequisite build step
+
+Services that import `@wafflefinance/sdk` from its compiled output
+(coordinator, relayer, resolver) require the SDK to be built before tests run:
+
+```bash
+pnpm --filter @wafflefinance/sdk build   # build once before running service tests
+```
+
+The frontend and e2e suite alias SDK source directly and do **not** need a
+prior SDK build step.
+
 ## Root aggregate commands
 
 Run from the repository root. These fan out with `pnpm -r`, which visits every
