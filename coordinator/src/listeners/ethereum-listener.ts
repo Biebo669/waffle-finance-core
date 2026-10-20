@@ -68,6 +68,7 @@ interface PendingEvent {
 // ---------------------------------------------------------------------------
 
 export class EthereumListener {
+  private startingOrStarted = false;
   private readonly client: PublicClient;
   private readonly log: Logger;
 
@@ -121,11 +122,14 @@ export class EthereumListener {
   // ─── Public interface ────────────────────────────────────────────────────
 
   start(): void {
+    // Claim startup synchronously before catch-up yields to another wake call.
+    if (this.startingOrStarted) return;
     if (!this.cfg.ethereum.htlcEscrow) {
       this.log.warn("ETH_HTLC_ESCROW not configured - Ethereum listener disabled");
       return;
     }
     const address = this.cfg.ethereum.htlcEscrow;
+    this.startingOrStarted = true;
     this.log.info({ contract: address }, "starting");
 
     void (async () => {

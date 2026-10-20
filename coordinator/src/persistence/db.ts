@@ -605,45 +605,33 @@ async function openPostgresDatabase(url: string): Promise<PostgresDatabase> {
 
     const sql = loadMigrationFile(migrationsDir, file);
 
-    const t0 = Date.now();
-    const client = await pool.connect();
-    try {
-      // Each migration runs in its own transaction so a failure leaves the
-      // schema_migrations table in a consistent state and the migration can
-      // be re-attempted after the underlying problem is fixed.
-      await client.query("BEGIN");
-      try {
-        await client.query(sql);
-        await client.query("COMMIT");
-      } catch (err: any) {
-        await client.query("ROLLBACK");
-        // "already exists" errors from idempotent DDL (CREATE TABLE IF NOT
-        // EXISTS, ADD CONSTRAINT IF NOT EXISTS) are safe to ignore — the
-        // migration has logically been applied even if Postgres complains.
-        if (!err.message?.includes("already exists")) {
-          throw new Error(
-            `Migration ${file} failed: ${err.message ?? String(err)}. ` +
-              `Fix the underlying issue and restart the coordinator. ` +
-              `See coordinator/docs/migration-strategy.md for rollback guidance.`
-          );
-        }
-      }
-    } finally {
-      client.release();
-    }
-    const durationMs = Date.now() - t0;
-
-    // Record the completed migration.  ON CONFLICT DO NOTHING guards against
-    // concurrent coordinator starts racing to insert the same row.
-    await pool.query(
-      "INSERT INTO schema_migrations (migration, applied_at, duration_ms) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-      [file, Math.floor(Date.now() / 1000), durationMs]
-    );
+    await applyPostgresMigration(pool, file, sql);
   }
 
   return new PostgresDatabase(pool);
 }
 
+/** Apply DDL and its registry entry atomically on one checked-out connection. */
+export async function applyPostgresMigration(pool: Pool, file: string, sql: string): Promise<void> {
+  const client = await pool.connect();
+  const startedAt = Date.now();
+  try {
+    await client.query("BEGIN");
+    try {
+      await client.query(sql);
+      await client.query(
+        "INSERT INTO schema_migrations (migration, applied_at, duration_ms) VALUES ($1, $2, $3)",
+        [file, Math.floor(Date.now() / 1000), Date.now() - startedAt]
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw new Error(`Migration ${file} failed`, { cause: err });
+    }
+  } finally {
+    client.release();
+  }
+}
 // ── Migration file loader ─────────────────────────────────────────────────────
 
 /**
