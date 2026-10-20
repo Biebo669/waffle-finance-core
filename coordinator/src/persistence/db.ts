@@ -296,6 +296,12 @@ export const SQLITE_MIGRATIONS = [
   "013_replay_safety.sql",
 ] as const;
 
+// Keep logical history names stable while selecting dialect-correct SQL.
+export const SQLITE_MIGRATION_OVERRIDES: Readonly<Record<string, string>> = {
+  "001_initial.sql": "001_initial_sqlite.sql",
+  "003_secret_encryption.sql": "003_secret_encryption_sqlite.sql",
+};
+
 /**
  * Canonical Postgres migration sequence, in application order.
  *
@@ -832,6 +838,9 @@ export function validateMigrationRegistry(
 
   // 3. Every registered name is loadable from disk (with the Postgres fallback).
   const registeredMissing: string[] = [];
+  for (const file of Object.values(SQLITE_MIGRATION_OVERRIDES)) {
+    if (!fileExists(resolve(migrationsDir, file))) registeredMissing.push(file);
+  }
   for (const file of [...SQLITE_MIGRATIONS, ...POSTGRES_MIGRATION_FILES]) {
     const genericName = file.replace("_postgres.sql", ".sql");
     const primaryExists = fileExists(resolve(migrationsDir, file));
@@ -846,7 +855,10 @@ export function validateMigrationRegistry(
   }
 
   // 4. Every numbered .sql file on disk is registered in at least one list.
-  const registered = new Set<string>([...SQLITE_MIGRATIONS, ...POSTGRES_MIGRATION_FILES]);
+  const registered = new Set<string>([
+    ...SQLITE_MIGRATIONS, ...POSTGRES_MIGRATION_FILES,
+    ...Object.values(SQLITE_MIGRATION_OVERRIDES),
+  ]);
   const unregistered = listMigrationFiles(migrationsDir).filter((f) => !registered.has(f));
   if (unregistered.length > 0) {
     errors.push(
