@@ -248,7 +248,7 @@ point and the reasoning behind the layout (#731).
 | **Chain-neutral** | | |
 | `@wafflefinance/sdk/types` | `Chain`, `Direction`, `OrderStatus`, `Order`, `ChainLeg`, `ResolverInfo`, external-bridge route types. Zero runtime cost (types only). | none |
 | `@wafflefinance/sdk/htlc-client` | `IHTLCClient`, `HTLCError`, `HTLCErrorCode`, result types. | none |
-| `@wafflefinance/sdk/secrets` | `generateSecret`, `hashSecret`, `verifyPreimage`. | viem¹ |
+| `@wafflefinance/sdk/secrets` | `generateSecret`, `hashSecret`, `verifyPreimage`. Cross-chain digest rules and a published test vector: [HASHLOCK_COMPATIBILITY.md](../../contracts/docs/HASHLOCK_COMPATIBILITY.md). | viem¹ |
 | `@wafflefinance/sdk/state-machine` | SDK-local order transition guards (`canTransition`, `requireTransition`, `isTerminal`, `nextStatesOf`). | none |
 | `@wafflefinance/sdk/status-display` | `describeOrderStatus`, `displayStatusFor`, `statusDisplay`, `ALL_DISPLAY_STATUSES` — user-facing status copy. | none |
 | `@wafflefinance/sdk/approval` | `APPROVAL_SEMANTICS`, `normalizeApprovalMessage`, `isApprovalError` — per-chain approval guidance. | none |
