@@ -2,6 +2,11 @@ import { expect } from "chai";
 import { ethers } from "hardhat";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
 import type { HTLCEscrow, TestERC20 } from "../typechain-types";
+import type {
+  ReturnsTrueERC20,
+  NoReturnERC20,
+  ReturnsFalseERC20,
+} from "../typechain-types";
 
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
 const TIMELOCK = 600; // 10 minutes
@@ -1326,6 +1331,444 @@ describe("HTLCEscrow v2", () => {
       const order = await escrow.getOrder(1);
       expect(order.status).to.equal(2); // Refunded
       expect(order.finalisedAt).to.be.greaterThan(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #867 — zero-address constructor tests for escrow dependencies
+  // ---------------------------------------------------------------------------
+  describe("constructor — zero-address dependency guards (#867)", () => {
+    // HTLCEscrow constructor:
+    //   constructor(IResolverRegistry _resolverRegistry, uint256 _minSafetyDeposit)
+    //
+    // _resolverRegistry is intentionally optional (address(0) disables the sybil
+    // gate and makes createOrder permissionless), so passing zero is accepted.
+    // _minSafetyDeposit = 0 is also accepted (advisory only).
+    //
+    // ResolverRegistry constructor:
+    //   constructor(IERC20 _stakeAsset, uint256 _minStake, address _slashBeneficiary, address _owner)
+    //
+    // All three address parameters are required to be non-zero; minStake must be > 0.
+
+    it("HTLCEscrow: accepts address(0) as resolverRegistry — permissionless mode is intentional", async () => {
+      const HTLCEscrowFactory = await ethers.getContractFactory("HTLCEscrow");
+      // Should deploy without reverting; zero registry is the documented way to
+      // make createOrder permissionless.
+      const escrow = await HTLCEscrowFactory.deploy(ZERO_ADDR, 0);
+      expect(await escrow.resolverRegistry()).to.equal(ZERO_ADDR);
+    });
+
+    it("ResolverRegistry: reverts with InvalidAddress when stakeAsset is zero", async () => {
+      const [owner] = await ethers.getSigners();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      await expect(
+        RegistryFactory.deploy(
+          ZERO_ADDR,           // _stakeAsset — required non-zero
+          ethers.parseEther("1"),
+          owner.address,
+          owner.address
+        )
+      ).to.be.revertedWithCustomError(
+        await RegistryFactory.deploy(
+          await deployToken().then((t) => t.getAddress()),
+          ethers.parseEther("1"),
+          owner.address,
+          owner.address
+        ),
+        "InvalidAddress"
+      );
+    });
+
+    it("ResolverRegistry: reverts with InvalidAddress when slashBeneficiary is zero", async () => {
+      const [owner] = await ethers.getSigners();
+      const token = await deployToken();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      const stub = await RegistryFactory.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      await expect(
+        RegistryFactory.deploy(
+          await token.getAddress(),
+          ethers.parseEther("1"),
+          ZERO_ADDR,           // _slashBeneficiary — required non-zero
+          owner.address
+        )
+      ).to.be.revertedWithCustomError(stub, "InvalidAddress");
+    });
+
+    it("ResolverRegistry: reverts when owner is zero — OpenZeppelin Ownable guard fires first", async () => {
+      // OpenZeppelin's Ownable constructor checks for address(0) before
+      // our InvalidAddress guard, so the revert reason is OwnableInvalidOwner.
+      // Both guards protect against the same misconfiguration; the OZ check
+      // simply fires first in the constructor execution order.
+      const [owner] = await ethers.getSigners();
+      const token = await deployToken();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      const stub = await RegistryFactory.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      await expect(
+        RegistryFactory.deploy(
+          await token.getAddress(),
+          ethers.parseEther("1"),
+          owner.address,
+          ZERO_ADDR            // _owner — protected by OZ Ownable before InvalidAddress
+        )
+      ).to.be.revertedWithCustomError(stub, "OwnableInvalidOwner");
+    });
+
+    it("ResolverRegistry: reverts with InvalidAmount when minStake is zero", async () => {
+      const [owner] = await ethers.getSigners();
+      const token = await deployToken();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      const stub = await RegistryFactory.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      await expect(
+        RegistryFactory.deploy(
+          await token.getAddress(),
+          0,                   // _minStake — must be > 0
+          owner.address,
+          owner.address
+        )
+      ).to.be.revertedWithCustomError(stub, "InvalidAmount");
+    });
+
+    it("ResolverRegistry: deploys successfully when all required addresses are valid and minStake > 0", async () => {
+      const [owner] = await ethers.getSigners();
+      const token = await deployToken();
+      const RegistryFactory = await ethers.getContractFactory("ResolverRegistry");
+      const registry = await RegistryFactory.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      expect(await registry.stakeAsset()).to.equal(await token.getAddress());
+      expect(await registry.slashBeneficiary()).to.equal(owner.address);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #869 — duplicate claim/refund attempt tests
+  // ---------------------------------------------------------------------------
+  describe("duplicate finalization attempts (#869)", () => {
+    // Helper: create a funded native-ETH order and return its id along with
+    // the escrow instance, preimage, and signers.
+    async function setupFundedOrder() {
+      const [sender, beneficiary, relayer] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+      return { escrow, preimage, sender, beneficiary, relayer, orderId: 1n };
+    }
+
+    it("second claimOrder on the same order reverts with OrderNotClaimable, no funds move", async () => {
+      const { escrow, preimage, beneficiary, orderId } = await setupFundedOrder();
+      const escrowAddr = await escrow.getAddress();
+
+      // First claim succeeds.
+      await escrow.connect(beneficiary).claimOrder(orderId, preimage);
+      expect((await escrow.getOrder(orderId)).status).to.equal(1); // Claimed
+
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      // Second claim must revert.
+      await expect(
+        escrow.connect(beneficiary).claimOrder(orderId, preimage)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotClaimable");
+
+      // No funds left the contract on the duplicate attempt (balance unchanged).
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+
+      // Only one OrderClaimed event was ever emitted for this order id.
+      const filter = escrow.filters.OrderClaimed(orderId);
+      const events = await escrow.queryFilter(filter);
+      expect(events.length).to.equal(1);
+    });
+
+    it("refundOrder after a successful claim reverts with OrderNotRefundable, no funds move", async () => {
+      const { escrow, preimage, beneficiary, sender, orderId } = await setupFundedOrder();
+      const escrowAddr = await escrow.getAddress();
+
+      // Claim the order first.
+      await escrow.connect(beneficiary).claimOrder(orderId, preimage);
+      expect((await escrow.getOrder(orderId)).status).to.equal(1); // Claimed
+
+      // Advance time past the timelock so a refund would otherwise be valid.
+      await time.increase(TIMELOCK + 1);
+
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      // Refund after claim must revert.
+      await expect(
+        escrow.connect(sender).refundOrder(orderId)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotRefundable");
+
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+
+      // No OrderRefunded event was emitted.
+      const filter = escrow.filters.OrderRefunded(orderId);
+      const events = await escrow.queryFilter(filter);
+      expect(events.length).to.equal(0);
+    });
+
+    it("second refundOrder on the same order reverts with OrderNotRefundable, no funds move", async () => {
+      const { escrow, sender, orderId } = await setupFundedOrder();
+      const escrowAddr = await escrow.getAddress();
+
+      // Advance past expiry and execute the first refund.
+      await time.increase(TIMELOCK + 1);
+      await escrow.connect(sender).refundOrder(orderId);
+      expect((await escrow.getOrder(orderId)).status).to.equal(2); // Refunded
+
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      // Second refund attempt must revert.
+      await expect(
+        escrow.connect(sender).refundOrder(orderId)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotRefundable");
+
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+
+      // Exactly one OrderRefunded event for this order.
+      const filter = escrow.filters.OrderRefunded(orderId);
+      const events = await escrow.queryFilter(filter);
+      expect(events.length).to.equal(1);
+    });
+
+    it("claimOrder after a successful refund reverts with OrderNotClaimable, no funds move", async () => {
+      const { escrow, preimage, sender, beneficiary, orderId } = await setupFundedOrder();
+      const escrowAddr = await escrow.getAddress();
+
+      // Refund the order first.
+      await time.increase(TIMELOCK + 1);
+      await escrow.connect(sender).refundOrder(orderId);
+      expect((await escrow.getOrder(orderId)).status).to.equal(2); // Refunded
+
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      // Claim after refund must revert — even with a valid preimage.
+      await expect(
+        escrow.connect(beneficiary).claimOrder(orderId, preimage)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotClaimable");
+
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+
+      // No OrderClaimed event was emitted.
+      const filter = escrow.filters.OrderClaimed(orderId);
+      const events = await escrow.queryFilter(filter);
+      expect(events.length).to.equal(0);
+    });
+
+    it("finalisedAt is set exactly once and is not overwritten by a duplicate attempt", async () => {
+      const { escrow, preimage, beneficiary, sender, orderId } = await setupFundedOrder();
+
+      // Claim the order.
+      await escrow.connect(beneficiary).claimOrder(orderId, preimage);
+      const finalisedAt = (await escrow.getOrder(orderId)).finalisedAt;
+      expect(finalisedAt).to.be.greaterThan(0n);
+
+      // Advance past expiry so a refund would conceptually be eligible.
+      await time.increase(TIMELOCK + 1);
+
+      // Duplicate refund attempt should revert.
+      await expect(
+        escrow.connect(sender).refundOrder(orderId)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotRefundable");
+
+      // finalisedAt is unchanged.
+      expect((await escrow.getOrder(orderId)).finalisedAt).to.equal(finalisedAt);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #870 — ERC20 transfer return variant regression cases
+  // ---------------------------------------------------------------------------
+  describe("ERC20 transfer return variants (#870)", () => {
+    // SafeERC20 handles three ERC20 return patterns:
+    //   - Returns true   → accepted (standard ERC20)
+    //   - Returns nothing → accepted (USDT-style void transfer)
+    //   - Returns false  → rejected (SafeERC20 treats false as revert)
+    //
+    // These tests verify that the escrow's safeTransferFrom / safeTransfer
+    // path behaves correctly for each variant.
+
+    const TOKEN_SUPPLY = ethers.parseEther("1000000");
+
+    async function deployReturnsTrueToken() {
+      const F = await ethers.getContractFactory("ReturnsTrueERC20");
+      return F.deploy(TOKEN_SUPPLY) as Promise<ReturnsTrueERC20>;
+    }
+
+    async function deployNoReturnToken() {
+      const F = await ethers.getContractFactory("NoReturnERC20");
+      return F.deploy(TOKEN_SUPPLY) as Promise<NoReturnERC20>;
+    }
+
+    async function deployReturnsFalseToken() {
+      const F = await ethers.getContractFactory("ReturnsFalseERC20");
+      return F.deploy(TOKEN_SUPPLY) as Promise<ReturnsFalseERC20>;
+    }
+
+    // ── createOrder (safeTransferFrom) ───────────────────────────────────────
+
+    it("standard (returns true): createOrder locks tokens successfully", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployReturnsTrueToken();
+      const escrowAddr = await escrow.getAddress();
+
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          await token.getAddress(),
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          hashlock,
+          TIMELOCK,
+          { value: SAFETY_DEPOSIT }
+        )
+      ).to.not.be.reverted;
+
+      expect(await token.balanceOf(escrowAddr)).to.equal(AMOUNT);
+    });
+
+    it("no-return (void transfer): createOrder locks tokens successfully", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployNoReturnToken();
+      const escrowAddr = await escrow.getAddress();
+
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          await token.getAddress(),
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          hashlock,
+          TIMELOCK,
+          { value: SAFETY_DEPOSIT }
+        )
+      ).to.not.be.reverted;
+
+      expect(await token.balanceOf(escrowAddr)).to.equal(AMOUNT);
+    });
+
+    it("false-return: createOrder reverts — SafeERC20 rejects a false transferFrom", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployReturnsFalseToken();
+      const escrowAddr = await escrow.getAddress();
+
+      // Even with a generous approval, ReturnsFalseERC20.transferFrom always
+      // returns false; SafeERC20 must surface this as a revert so the order
+      // is never created.
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          await token.getAddress(),
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          hashlock,
+          TIMELOCK,
+          { value: SAFETY_DEPOSIT }
+        )
+      ).to.be.reverted; // SafeERC20 reverts on false return
+
+      // No order was stored.
+      expect(await escrow.nextOrderId()).to.equal(1n);
+    });
+
+    // ── claimOrder (safeTransfer) ────────────────────────────────────────────
+
+    it("standard (returns true): claimOrder transfers tokens to beneficiary", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployReturnsTrueToken();
+      const escrowAddr = await escrow.getAddress();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        await token.getAddress(),
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: SAFETY_DEPOSIT }
+      );
+
+      const beneficiaryBefore = await token.balanceOf(beneficiary.address);
+      await escrow.connect(beneficiary).claimOrder(1, preimage);
+
+      expect(await token.balanceOf(beneficiary.address)).to.equal(
+        beneficiaryBefore + AMOUNT
+      );
+      expect(await token.balanceOf(escrowAddr)).to.equal(0n);
+    });
+
+    it("no-return (void transfer): claimOrder transfers tokens to beneficiary", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const token = await deployNoReturnToken();
+      const escrowAddr = await escrow.getAddress();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await token.connect(sender).approve(escrowAddr, AMOUNT);
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        await token.getAddress(),
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: SAFETY_DEPOSIT }
+      );
+
+      const beneficiaryBefore = await token.balanceOf(beneficiary.address);
+      await escrow.connect(beneficiary).claimOrder(1, preimage);
+
+      expect(await token.balanceOf(beneficiary.address)).to.equal(
+        beneficiaryBefore + AMOUNT
+      );
+      expect(await token.balanceOf(escrowAddr)).to.equal(0n);
     });
   });
 });
